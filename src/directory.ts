@@ -461,6 +461,86 @@ export function createDirectory(projectRoot: string): void {
   // Write .gitignore inside .codegraph (create if absent, upgrade a stale
   // pre-wildcard default left by an older version — issue #788).
   ensureGitignore(path.join(codegraphDir, '.gitignore'));
+
+  // Locally hide .codegraph/ from the enclosing git repo without touching the
+  // tracked .gitignore — see addLocalGitExclude.
+  addLocalGitExclude(projectRoot);
+}
+
+/**
+ * Locally hide the `.codegraph/` data dir from the enclosing git repo WITHOUT
+ * touching the committed `.gitignore`, by appending an anchored pattern to
+ * `.git/info/exclude` — git's per-clone, uncommitted ignore file. This means a
+ * project never has to modify (and commit) its `.gitignore` just to keep the
+ * index dir out of `git status`.
+ *
+ * Robust + idempotent + best-effort:
+ *   - walks up to the git root (init may run in a subdirectory of the repo);
+ *   - handles a `.git` FILE (worktree/submodule) by resolving its gitdir and
+ *     the shared `commondir`, since `info/exclude` lives in the common dir;
+ *   - writes an anchored, repo-root-relative pattern (`/.codegraph/`, or
+ *     `/sub/dir/.codegraph/` for a nested project);
+ *   - never adds a duplicate, and never throws — a non-git dir, a permission
+ *     error, or an unusual layout is silently skipped.
+ */
+export function addLocalGitExclude(projectRoot: string): void {
+  try {
+    // 1. Find the git root at or above projectRoot.
+    let gitRoot = path.resolve(projectRoot);
+    let gitPath: string | null = null;
+    for (;;) {
+      const candidate = path.join(gitRoot, '.git');
+      if (fs.existsSync(candidate)) { gitPath = candidate; break; }
+      const parent = path.dirname(gitRoot);
+      if (parent === gitRoot) break;
+      gitRoot = parent;
+    }
+    if (!gitPath) return; // not inside a git repo
+
+    // 2. Resolve the common git dir (where info/exclude lives).
+    let gitCommonDir: string;
+    const stat = fs.statSync(gitPath);
+    if (stat.isDirectory()) {
+      gitCommonDir = gitPath;
+    } else if (stat.isFile()) {
+      // Worktree/submodule: `.git` is a file `gitdir: <path>`.
+      const m = fs.readFileSync(gitPath, 'utf8').match(/^gitdir:\s*(.+?)\s*$/m);
+      if (!m || !m[1]) return;
+      let gitDir = m[1].trim();
+      if (!path.isAbsolute(gitDir)) gitDir = path.resolve(gitRoot, gitDir);
+      gitCommonDir = gitDir;
+      try {
+        const cd = fs.readFileSync(path.join(gitDir, 'commondir'), 'utf8').trim();
+        gitCommonDir = path.isAbsolute(cd) ? cd : path.resolve(gitDir, cd);
+      } catch { /* no commondir → gitDir is already the common dir */ }
+    } else {
+      return;
+    }
+
+    // 3. Anchored, repo-root-relative pattern for the .codegraph dir.
+    const codegraphDir = getCodeGraphDir(projectRoot);
+    const rel = path.relative(gitRoot, codegraphDir).split(path.sep).join('/');
+    if (!rel || rel.startsWith('..')) return; // outside the repo — don't touch
+    const pattern = `/${rel}/`;
+
+    const infoDir = path.join(gitCommonDir, 'info');
+    const excludePath = path.join(infoDir, 'exclude');
+    let existing = '';
+    try { existing = fs.readFileSync(excludePath, 'utf8'); } catch { /* none yet */ }
+
+    const bare = rel; // e.g. ".codegraph" (root) or "sub/.codegraph"
+    const already = existing.split('\n').some((line) => {
+      const t = line.trim();
+      return t === pattern || t === bare || t === `${bare}/` || t === `/${bare}`;
+    });
+    if (already) return;
+
+    fs.mkdirSync(infoDir, { recursive: true });
+    const sep = existing.length > 0 && !existing.endsWith('\n') ? '\n' : '';
+    fs.appendFileSync(excludePath, `${sep}${pattern}\n`);
+  } catch {
+    /* best-effort — never fail init over a local git exclude */
+  }
 }
 
 /**
