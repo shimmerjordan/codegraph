@@ -12,10 +12,11 @@
  * `__tests__/mcp-initialize.test.ts` still drive this code path.
  */
 
+import * as fs from 'fs';
 import * as path from 'path';
 import { JsonRpcRequest, JsonRpcNotification, JsonRpcTransport, ErrorCodes } from './transport';
 import { MCPEngine } from './engine';
-import { tools } from './tools';
+import { tools, toolCallOutcome } from './tools';
 import { SERVER_INSTRUCTIONS, SERVER_INSTRUCTIONS_NO_ROOT_INDEX } from './server-instructions';
 import { CodeGraphPackageVersion } from './version';
 import { findNearestCodeGraphRoot } from '../directory';
@@ -67,6 +68,27 @@ function firstRootPath(result: unknown): string | null {
   const first = roots[0] as { uri?: unknown };
   if (typeof first?.uri !== 'string') return null;
   return fileUriToPath(first.uri);
+}
+
+/**
+ * Workspace a tool call should be ATTRIBUTED to in the local metrics: the
+ * index root of the `projectPath` the call actually queried, realpath'd to
+ * match how the CLI/daemon key projects. Every tool requires `projectPath`
+ * (cross-project calls are routine), so attributing to the daemon's default
+ * project — the old behavior — piled every project's calls onto one row.
+ * Falls back to the engine/session default when the argument is absent or
+ * resolves to no index.
+ */
+export function resolveMetricsWorkspace(argPath: unknown, fallback: string | null): string | null {
+  if (typeof argPath === 'string' && argPath) {
+    try {
+      const root = findNearestCodeGraphRoot(argPath);
+      if (root) {
+        try { return fs.realpathSync(root); } catch { return root; }
+      }
+    } catch { /* fall through to the session default */ }
+  }
+  return fallback;
 }
 
 export interface MCPSessionOptions {
@@ -271,10 +293,10 @@ export class MCPSession {
     // response (in-memory increment only; see src/telemetry + src/metrics).
     getTelemetry().recordUsage('mcp_tool', toolName, !result.isError, this.clientInfo);
     getMetrics().recordToolCall({
-      workspace: this.engine.getProjectPath(),
+      workspace: resolveMetricsWorkspace(toolArgs.projectPath, this.engine.getProjectPath()),
       tool: toolName,
       agent: this.clientInfo?.name,
-      ok: !result.isError,
+      outcome: toolCallOutcome(result),
       durationMs,
       outTokens: estimateResultTokens(result),
     });

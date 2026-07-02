@@ -228,13 +228,14 @@ export function ToolsTable(props: { tools: ToolStat[] }) {
       <div className="table-scroll">
         <table>
           <thead>
-            <tr><th>Tool</th><th className="num">Calls</th><th className="num">Error rate</th><th className="num">Avg latency</th><th className="num">Est. tokens</th></tr>
+            <tr><th>Tool</th><th className="num">Calls</th><th className="num">Answered</th><th className="num">Error rate</th><th className="num">Avg latency</th><th className="num">Est. tokens</th></tr>
           </thead>
           <tbody>
             {props.tools.map((t) => (
               <tr key={t.tool}>
                 <td className="mono">{t.tool}</td>
                 <td className="num">{fmtInt(t.calls)}</td>
+                <td className="num" title="Answered from a real index — excludes errors and not-indexed guidance replies">{fmtPct(t.calls - t.errors - (t.guidance ?? 0), t.calls)}</td>
                 <td className="num">{fmtPct(t.errors, t.calls)}</td>
                 <td className="num">{t.avgMs.toFixed(0)} ms</td>
                 <td className="num">{fmtTokens(t.outTokens)}</td>

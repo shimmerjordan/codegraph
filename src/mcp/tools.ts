@@ -468,6 +468,25 @@ export interface ToolResult {
     text: string;
   }>;
   isError?: boolean;
+  /**
+   * MCP-legal metadata side-channel (the spec allows `_meta` on results;
+   * clients ignore it). Carries `'codegraph/outcome': 'guidance'` on the
+   * success-SHAPED not-indexed replies so the local metrics can distinguish
+   * "answered from a real index" from "returned guidance" — without ever
+   * setting `isError` (which teaches agents to abandon the toolset).
+   */
+  _meta?: Record<string, unknown>;
+}
+
+/**
+ * Classify a {@link ToolResult} for the local metrics dashboard:
+ * `error` (genuine malfunction / refusal), `guidance` (success-shaped
+ * not-indexed reply — not a real answer), or `ok`.
+ */
+export function toolCallOutcome(result: ToolResult): 'ok' | 'guidance' | 'error' {
+  if (result.isError) return 'error';
+  if (result._meta?.['codegraph/outcome'] === 'guidance') return 'guidance';
+  return 'ok';
 }
 
 /**
@@ -1415,7 +1434,7 @@ export class ToolHandler {
       // agent keeps trusting the toolset for projects that ARE indexed.
       // (An isError here teaches session-long abandonment — see NotIndexedError.)
       if (err instanceof NotIndexedError) {
-        return this.textResult(err.message);
+        return this.guidanceResult(err.message);
       }
       // Security refusal: a clean error, no retry encouragement.
       if (err instanceof PathRefusalError) {
@@ -1447,7 +1466,7 @@ export class ToolHandler {
       return await this.dispatchTool(toolName, args);
     } catch (err) {
       if (err instanceof NotIndexedError) {
-        return this.textResult(err.message);
+        return this.guidanceResult(err.message);
       }
       if (err instanceof PathRefusalError) {
         return this.errorResult(err.message);
@@ -4576,6 +4595,19 @@ export class ToolHandler {
   private textResult(text: string): ToolResult {
     return {
       content: [{ type: 'text', text }],
+    };
+  }
+
+  /**
+   * Success-shaped guidance (NotIndexed and friends): same wire shape as
+   * {@link textResult} — NEVER `isError` — but tagged in `_meta` so the local
+   * metrics count it as "guidance", not as an answered call. Without the tag
+   * the dashboard's success rate was pinned at ~100% no matter what.
+   */
+  private guidanceResult(text: string): ToolResult {
+    return {
+      content: [{ type: 'text', text }],
+      _meta: { 'codegraph/outcome': 'guidance' },
     };
   }
 

@@ -3,6 +3,8 @@
 export interface Overview {
   totalCalls: number;
   totalErrors: number;
+  /** Calls answered with not-indexed guidance instead of a real result. */
+  totalGuidance: number;
   totalOutTokens: number;
   cacheHits: number;
   cacheMisses: number;
@@ -14,6 +16,7 @@ export interface ToolStat {
   tool: string;
   calls: number;
   errors: number;
+  guidance: number;
   avgMs: number;
   outTokens: number;
 }
@@ -26,6 +29,7 @@ export interface DayStat {
   day: string;
   calls: number;
   errors: number;
+  guidance: number;
   outTokens: number;
 }
 export interface Workspace {

@@ -406,8 +406,9 @@ describe('Shared MCP daemon (issue #411)', () => {
   it('proxy survives the daemon dying mid-session and keeps serving (#662)', async () => {
     // The #662 scenario: an MCP host SIGTERM's the shared daemon while a session
     // is live. The proxy must NOT exit (losing CodeGraph for that session) — it
-    // falls back to an in-process engine and keeps answering.
-    const env = { CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS: '30000', CODEGRAPH_PPID_POLL_MS: '5000' };
+    // falls back to an in-process engine and keeps answering. RECONNECT=0 pins
+    // this test to the degraded path (the auto re-attach has its own test below).
+    const env = { CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS: '30000', CODEGRAPH_PPID_POLL_MS: '5000', CODEGRAPH_MCP_RECONNECT: '0' };
     const server = spawnServer(tempDir, env);
     servers.push(server);
     sendInitialize(server.child, `file://${tempDir}`, 1);
@@ -432,4 +433,36 @@ describe('Shared MCP daemon (issue #411)', () => {
     expect(resp.result !== undefined || resp.error !== undefined).toBe(true);
     expect(isAlive(server.child.pid!)).toBe(true);
   }, 45000);
+
+  it('proxy auto re-attaches: respawns the daemon from the same project config after mid-session loss', async () => {
+    // Terminal-drop scenario: the shared daemon goes away while a session is
+    // live. Beyond the #662 in-process fallback, the proxy must re-run the
+    // probe→spawn→attach pipeline in the background so the project goes back to
+    // shared `serving` — without the user restarting the agent.
+    const env = { CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS: '30000', CODEGRAPH_PPID_POLL_MS: '5000' };
+    const server = spawnServer(tempDir, env);
+    servers.push(server);
+    sendInitialize(server.child, `file://${tempDir}`, 1);
+    await waitFor(() => findResponse(server.stdout, 1), 10000);
+    await waitFor(() => server.stderr.some((l) => l.includes('Attached to shared daemon')), 8000);
+    await waitFor(() => (readLockPid(realRoot) ?? 0) > 0, 8000);
+    const daemonPid = readLockPid(realRoot)!;
+
+    // Kill the daemon out from under the live proxy.
+    process.kill(daemonPid, 'SIGTERM');
+    expect(await waitProcessExit(daemonPid, 8000)).toBe(true);
+
+    // The proxy re-attaches to a freshly-respawned daemon (first retry ~1s).
+    await waitFor(() => server.stderr.some((l) => l.includes('Re-attached to shared daemon')), 20000);
+    const newPid = readLockPid(realRoot)!;
+    expect(newPid).toBeGreaterThan(0);
+    expect(newPid).not.toBe(daemonPid);
+    expect(isAlive(newPid)).toBe(true);
+
+    // Calls flow again — and through the shared daemon, not the fallback.
+    sendMessage(server.child, { jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'codegraph_status', arguments: {} } });
+    const resp = await waitFor(() => findResponse(server.stdout, 4), 15000);
+    expect(resp.result !== undefined || resp.error !== undefined).toBe(true);
+    expect(isAlive(server.child.pid!)).toBe(true);
+  }, 60000);
 });

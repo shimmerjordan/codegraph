@@ -14,6 +14,14 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A local web dashboard (`codegraph dashboard`, also `codegraph web`) to monitor how CodeGraph is used on your machine — tool-call volume and success rate, the context CodeGraph served, cache hit rate, live daemon CPU/memory, and every indexed workspace, with charts and per-project drill-down. All data is read from a single local file and never leaves your machine. See `DASHBOARD.md`.
 - The dashboard can also show how much direct file-reading (`Read`/`Grep`/`Glob`) CodeGraph displaces. To make that possible, `codegraph install` now automatically wires the required tracking hook into Claude Code's settings (only when usage metrics are enabled — it's skipped, and later removed, if you opt out). If the hook isn't set up, the dashboard shows a clear warning with a one-click button to enable it.
 - `codegraph init` now hides the `.codegraph/` index directory from git locally via `.git/info/exclude`, so you no longer have to edit (and commit) each project's `.gitignore` just to keep it out of `git status`. It works whether you init at the repo root or in a subdirectory, is added retroactively when you re-run `init` on an already-initialized project, and leaves the tracked `.gitignore` untouched.
+- If the connection to the shared background daemon drops mid-session (a flaky terminal, the daemon being killed by another tool), CodeGraph now automatically reconnects — restarting the daemon from the project's existing configuration if needed — so the session returns to full shared serving instead of staying degraded until the agent restarts. Set `CODEGRAPH_MCP_RECONNECT=0` to keep the old behavior.
+
+### Fixes
+
+- The dashboard's "Success rate" was pinned at ~100% and effectively meaningless: replies that only carry "this project isn't indexed" guidance are deliberately success-shaped (so agents don't abandon the tools), and they were counted as successes. The dashboard now tracks them separately and shows an "Answered rate" — the share of calls answered from a real index — with errors and guidance replies broken out, both overall and per tool.
+- Dashboard statistics are now attributed to the project each call actually queried. Previously every call was credited to the daemon's default project, so in monorepos and cross-project sessions one project accumulated all the counts while the others showed zero.
+- Usage recorded while a project path (or agent name) contains a space no longer writes corrupted rows into the metrics database; existing corrupted rows are cleaned up automatically on the next start.
+- Tool calls served during a daemon outage (the in-process fallback) now show up in the dashboard instead of silently vanishing from the stats.
 
 ## [1.1.6] - 2026-06-30
 

@@ -29,10 +29,33 @@ import { SERVER_INFO, PROTOCOL_VERSION } from './session';
 import { SERVER_INSTRUCTIONS } from './server-instructions';
 import { getStaticTools } from './tools';
 import { getTelemetry, ClientInfo } from '../telemetry';
+import { getMetrics, estimateResultTokens } from '../metrics';
+import { toolCallOutcome } from './tools';
+import { resolveMetricsWorkspace } from './session';
 import type { MCPEngine } from './engine';
 
 /** Default poll cadence for the PPID watchdog (same as the direct server). */
 const DEFAULT_PPID_POLL_MS = 5000;
+
+/**
+ * Backoff schedule for re-attaching to the shared daemon after a mid-session
+ * connection loss. Each attempt runs the full probe→spawn→poll pipeline
+ * ({@link LocalHandshakeDeps.getDaemonSocket}), so a "dead" daemon is respawned
+ * from the same project's `.codegraph/` config — an idle project goes back to
+ * `serving` without the user restarting the agent. The schedule is finite so a
+ * daemon that crashes on every boot can't be respawned in a loop forever; a
+ * connection that stays up {@link RECONNECT_BUDGET_RESET_MS} restores the
+ * budget. `CODEGRAPH_MCP_RECONNECT=0` disables re-attach entirely (pre-existing
+ * behavior: degrade to in-process for the rest of the session).
+ */
+const RECONNECT_DELAYS_MS = [1_000, 2_000, 5_000, 15_000, 30_000];
+const RECONNECT_BUDGET_RESET_MS = 60_000;
+
+/** Whether `CODEGRAPH_MCP_RECONNECT` was set to a falsy value (opt OUT). */
+function reconnectDisabled(): boolean {
+  const raw = process.env.CODEGRAPH_MCP_RECONNECT;
+  return !!raw && (raw === '0' || raw.toLowerCase() === 'false');
+}
 
 /**
  * Env var that opts INTO the "attached to shared daemon" log line. Off by
@@ -215,6 +238,12 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
   let daemonStatus: 'connecting' | 'ready' | 'failed' = 'connecting';
   let daemonSocket: net.Socket | null = null;
   let clientInitId: unknown = undefined;   // suppress the daemon's reply to the forwarded initialize
+  // The client's raw initialize line, kept so a RE-attached daemon can be
+  // primed exactly like the first one (project resolution + clientInfo).
+  let initLine: string | null = null;
+  let reconnectAttempt = 0;
+  let reconnecting = false;
+  let stableTimer: NodeJS.Timeout | null = null;
   // Telemetry attribution for the in-process fallback only — calls routed to
   // the daemon are counted by the daemon's own session (which receives the
   // forwarded initialize, clientInfo included), never double-counted here.
@@ -247,7 +276,12 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
     process.exit(0);
   };
   const ensureEngine = (): Promise<void> => {
-    if (!engine) engine = deps.makeEngine();
+    if (!engine) {
+      engine = deps.makeEngine();
+      // The degraded proxy is long-lived and records dashboard metrics for the
+      // calls it serves — flush them on an interval like the daemon does.
+      getMetrics().startInterval();
+    }
     if (!engineReady) engineReady = engine.ensureInitialized(deps.root).catch(() => { /* degraded */ });
     return engineReady;
   };
@@ -256,12 +290,23 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
     let msg: JsonRpc; try { msg = JSON.parse(line) as JsonRpc; } catch { return; }
     const id = msg.id;
     if (msg.method === 'tools/call' && id !== undefined) {
+      const params = (msg.params || {}) as { name: string; arguments?: Record<string, unknown> };
+      const startedAt = Date.now();
       try {
         await ensureEngine();
-        const params = (msg.params || {}) as { name: string; arguments?: Record<string, unknown> };
         const result = await engine!.getToolHandler().execute(params.name, params.arguments || {});
         writeClient({ jsonrpc: '2.0', id, result });
         getTelemetry().recordUsage('mcp_tool', params.name, !result.isError, telemetryClient);
+        // Mirror the daemon session's dashboard recording — without this, every
+        // call served during a degraded stretch vanished from the metrics.
+        getMetrics().recordToolCall({
+          workspace: resolveMetricsWorkspace(params.arguments?.projectPath, deps.root),
+          tool: params.name,
+          agent: telemetryClient?.name,
+          outcome: toolCallOutcome(result),
+          durationMs: Date.now() - startedAt,
+          outTokens: estimateResultTokens(result),
+        });
       } catch (err) {
         writeClient({ jsonrpc: '2.0', id, error: { code: -32603, message: err instanceof Error ? err.message : String(err) } });
       }
@@ -298,6 +343,7 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
       let msg: JsonRpc; try { msg = JSON.parse(line) as JsonRpc; } catch { routeToDaemon(line); continue; }
       if (msg.method === 'initialize') {
         clientInitId = msg.id;
+        initLine = line;
         const initParams = (msg.params ?? {}) as { clientInfo?: { name?: unknown; version?: unknown } };
         if (initParams.clientInfo) {
           telemetryClient = {
@@ -330,13 +376,14 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
   startPpidWatchdogNoSocket(shutdown);
 
   // ---- daemon connection (background) ----
-  let socket: net.Socket | null = null;
-  try { socket = await deps.getDaemonSocket(); } catch { socket = null; }
 
-  // `!socket.destroyed`: the connect-window error guard above can absorb an
-  // 'error' that already destroyed the socket before we got here (#974) — treat
-  // a dead socket as "no daemon" so we cleanly fall back to the in-process engine.
-  if (socket && !socket.destroyed && !shuttingDown) {
+  /**
+   * Wire a verified daemon socket into the session: relay its lines to the
+   * client (suppressing the reply to our forwarded initialize), and on loss
+   * fall back to the in-process engine + schedule a re-attach. Used for the
+   * initial background connect AND every reconnect.
+   */
+  const attachDaemon = (socket: net.Socket): void => {
     daemonSocket = socket;
     daemonStatus = 'ready';
     let sockBuf = '';
@@ -362,22 +409,66 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
     // The daemon going away does NOT end the session (#662). An MCP host can
     // SIGTERM the shared daemon when another session starts; if we exited here,
     // this host would silently lose CodeGraph and any in-flight request would
-    // hang. Instead, fall back to the in-process engine for the rest of the
-    // session and re-serve whatever the dead daemon never answered.
+    // hang. Fall back to the in-process engine, re-serve whatever the dead
+    // daemon never answered — and try to RE-attach in the background (the
+    // getDaemonSocket pipeline respawns a daemon from the same project config),
+    // so one hiccup doesn't degrade the whole session permanently.
     const onDaemonLost = (): void => {
-      if (shuttingDown || daemonStatus !== 'ready') return; // host teardown, or already handled
+      // Guard on identity too: a late 'error' from an already-replaced socket
+      // must not tear down the fresh connection.
+      if (shuttingDown || daemonSocket !== socket) return;
       daemonStatus = 'failed';
-      try { daemonSocket?.destroy(); } catch { /* ignore */ }
+      try { socket.destroy(); } catch { /* ignore */ }
       daemonSocket = null;
+      if (stableTimer) { clearTimeout(stableTimer); stableTimer = null; }
       process.stderr.write(
         `[CodeGraph MCP] Shared daemon connection lost; serving this session in-process (degraded), re-serving ${inflight.size} in-flight request(s).\n`
       );
       const orphaned = [...inflight.values()];
       inflight.clear();
       for (const line of orphaned) void handleLocally(line);
+      scheduleReconnect();
     };
     socket.on('close', onDaemonLost);
     socket.on('error', onDaemonLost);
+  };
+
+  const scheduleReconnect = (): void => {
+    if (shuttingDown || reconnecting || reconnectDisabled()) return;
+    if (reconnectAttempt >= RECONNECT_DELAYS_MS.length) return; // budget spent — stay in-process
+    reconnecting = true;
+    const delay = RECONNECT_DELAYS_MS[reconnectAttempt++];
+    const timer = setTimeout(() => { void tryReconnect(); }, delay);
+    timer.unref?.();
+  };
+
+  const tryReconnect = async (): Promise<void> => {
+    let socket: net.Socket | null = null;
+    try { socket = await deps.getDaemonSocket(); } catch { socket = null; }
+    reconnecting = false;
+    if (shuttingDown) { try { socket?.destroy(); } catch { /* ignore */ } return; }
+    if (!socket || socket.destroyed) { scheduleReconnect(); return; }
+    // Prime the fresh daemon with the client's original initialize BEFORE any
+    // tool call can route to it (its reply is suppressed by id, exactly like
+    // the initial prime).
+    if (initLine) { try { socket.write(initLine + '\n'); } catch { /* close path retries */ } }
+    attachDaemon(socket);
+    process.stderr.write('[CodeGraph MCP] Re-attached to shared daemon; resuming shared serving.\n');
+    // A connection that survives a minute proves the daemon is healthy again —
+    // restore the full re-attach budget for the next incident.
+    if (stableTimer) clearTimeout(stableTimer);
+    stableTimer = setTimeout(() => { reconnectAttempt = 0; }, RECONNECT_BUDGET_RESET_MS);
+    stableTimer.unref?.();
+  };
+
+  let socket: net.Socket | null = null;
+  try { socket = await deps.getDaemonSocket(); } catch { socket = null; }
+
+  // `!socket.destroyed`: the connect-window error guard above can absorb an
+  // 'error' that already destroyed the socket before we got here (#974) — treat
+  // a dead socket as "no daemon" so we cleanly fall back to the in-process engine.
+  if (socket && !socket.destroyed && !shuttingDown) {
+    attachDaemon(socket);
     for (const line of pending) { trackInflight(line); try { socket.write(line + '\n'); } catch { /* ignore */ } }
     pending.length = 0;
   } else if (!shuttingDown) {

@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { MetricsStore, estimateTokens, estimateResultTokens } from '../src/metrics/store';
+import { createDatabase } from '../src/db/sqlite-adapter';
 
 describe('metrics store', () => {
   let dir: string;
@@ -29,9 +30,9 @@ describe('metrics store', () => {
 
   it('aggregates tool calls into per-workspace/day/tool totals', () => {
     for (let i = 0; i < 5; i++) {
-      store.recordToolCall({ workspace: '/a', tool: 'codegraph_explore', agent: 'Claude Code', ok: i !== 0, durationMs: 10, outTokens: 100 });
+      store.recordToolCall({ workspace: '/a', tool: 'codegraph_explore', agent: 'Claude Code', outcome: i !== 0 ? 'ok' : 'error', durationMs: 10, outTokens: 100 });
     }
-    store.recordToolCall({ workspace: '/b', tool: 'codegraph_node', ok: true, durationMs: 20, outTokens: 50 });
+    store.recordToolCall({ workspace: '/b', tool: 'codegraph_node', outcome: 'ok', durationMs: 20, outTokens: 50 });
     store.flush();
 
     const ov = store.getOverview();
@@ -93,7 +94,7 @@ describe('metrics store', () => {
       root: '/a', files: 100, nodes: 3000, edges: 8000, languages: { typescript: 100 },
       dbSizeBytes: 1024, version: '1.1.6', pid: 1234, startedAt: 5,
     });
-    store.recordToolCall({ workspace: '/a', tool: 'codegraph_explore', ok: true, durationMs: 5, outTokens: 42 });
+    store.recordToolCall({ workspace: '/a', tool: 'codegraph_explore', outcome: 'ok', durationMs: 5, outTokens: 42 });
     store.flush();
 
     const ws = store.getWorkspaces(new Set(['/a']));
@@ -159,7 +160,7 @@ describe('metrics store', () => {
   it('deleteProject removes a project and its stats across all tables', () => {
     store.recordProject({ root: '/proj/keep', files: 1, nodes: 1, edges: 1, languages: {}, dbSizeBytes: 1, version: 'v', pid: 0, startedAt: 0 });
     store.recordProject({ root: '/proj/gone', files: 1, nodes: 1, edges: 1, languages: {}, dbSizeBytes: 1, version: 'v', pid: 0, startedAt: 0 });
-    store.recordToolCall({ workspace: '/proj/gone', tool: 't', ok: true, durationMs: 1, outTokens: 9 });
+    store.recordToolCall({ workspace: '/proj/gone', tool: 't', outcome: 'ok', durationMs: 1, outTokens: 9 });
     store.recordCache('/proj/gone', true);
     store.flush();
 
@@ -175,8 +176,8 @@ describe('metrics store', () => {
   });
 
   it('scopes overview/tools/daily to one workspace when asked', () => {
-    for (let i = 0; i < 4; i++) store.recordToolCall({ workspace: '/a', tool: 'codegraph_explore', ok: true, durationMs: 5, outTokens: 100 });
-    store.recordToolCall({ workspace: '/b', tool: 'codegraph_node', ok: true, durationMs: 5, outTokens: 50 });
+    for (let i = 0; i < 4; i++) store.recordToolCall({ workspace: '/a', tool: 'codegraph_explore', outcome: 'ok', durationMs: 5, outTokens: 100 });
+    store.recordToolCall({ workspace: '/b', tool: 'codegraph_node', outcome: 'ok', durationMs: 5, outTokens: 50 });
     store.flush();
 
     expect(store.getOverview().totalCalls).toBe(5);
@@ -191,10 +192,65 @@ describe('metrics store', () => {
   });
 
   it('a fresh flush persists across a re-opened store (shared DB, many writers)', () => {
-    store.recordToolCall({ workspace: '/a', tool: 't', ok: true, durationMs: 1, outTokens: 1 });
+    store.recordToolCall({ workspace: '/a', tool: 't', outcome: 'ok', durationMs: 1, outTokens: 1 });
     store.flush();
     const reader = new MetricsStore({ dir: path.join(dir, '.codegraph') });
     expect(reader.getOverview().totalCalls).toBe(1);
+    reader.close();
+  });
+
+  it('keeps columns intact when workspace / agent names contain spaces', () => {
+    // Regression: the host-tool delta keys were joined AND split on a plain
+    // space, so `/x/My Project` wrote rows whose `day` held a path fragment.
+    const ws = '/home/user/My Project';
+    store.recordToolCall({ workspace: ws, tool: 'codegraph_explore', agent: 'Visual Studio Code', outcome: 'ok', durationMs: 5, outTokens: 10 });
+    store.recordHostToolCall({ workspace: ws, tool: 'Read', outTokens: 40 });
+    store.recordCache(ws, true);
+    store.flush();
+
+    // Scoping by the full (space-containing) workspace finds the rows…
+    expect(store.getOverview(undefined, ws).totalCalls).toBe(1);
+    expect(store.getOverview(undefined, ws).hostCalls).toBe(1);
+    expect(store.getOverview(undefined, ws).cacheHits).toBe(1);
+    // …and the day column is a real date, so window filters behave.
+    const today = new Date().toISOString().slice(0, 10);
+    expect(store.getOverview(today, ws).hostCalls).toBe(1);
+    expect(store.getDailyStats(30, ws).every((d) => /^\d{4}-\d{2}-\d{2}$/.test(d.day))).toBe(true);
+  });
+
+  it('counts guidance separately from errors and answered calls', () => {
+    store.recordToolCall({ workspace: '/a', tool: 'codegraph_explore', outcome: 'ok', durationMs: 1, outTokens: 10 });
+    store.recordToolCall({ workspace: '/a', tool: 'codegraph_explore', outcome: 'guidance', durationMs: 1, outTokens: 5 });
+    store.recordToolCall({ workspace: '/a', tool: 'codegraph_explore', outcome: 'error', durationMs: 1, outTokens: 1 });
+    store.flush();
+
+    const ov = store.getOverview();
+    expect(ov.totalCalls).toBe(3);
+    expect(ov.totalErrors).toBe(1);
+    expect(ov.totalGuidance).toBe(1);
+
+    const t = store.getToolStats().find((x) => x.tool === 'codegraph_explore')!;
+    expect(t.calls).toBe(3);
+    expect(t.errors).toBe(1);
+    expect(t.guidance).toBe(1);
+
+    const day = store.getDailyStats(7)[0];
+    expect(day.guidance).toBe(1);
+  });
+
+  it('drops rows whose day column is not a date (repair of pre-fix corruption)', () => {
+    // Simulate what the old space-separated host keys wrote: a row whose day
+    // holds a path fragment. It must be purged on the next open.
+    store.recordHostToolCall({ workspace: '/a', tool: 'Read', outTokens: 4 });
+    store.flush();
+    store.close();
+    const { db } = createDatabase(path.join(dir, '.codegraph', 'metrics.db'));
+    db.prepare(`INSERT INTO host_tool_calls (workspace, day, tool, calls, out_tokens) VALUES (?, ?, ?, ?, ?)`)
+      .run('/home/user/My', 'Project', '2026-07-01', 3, 99);
+    db.close();
+
+    const reader = new MetricsStore({ dir: path.join(dir, '.codegraph') });
+    expect(reader.getOverview().hostCalls).toBe(1); // only the well-formed row survives
     reader.close();
   });
 });

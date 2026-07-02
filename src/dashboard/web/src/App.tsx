@@ -125,7 +125,13 @@ export function App() {
             label="CodeGraph calls" value={fmtInt(ov.totalCalls)} sub={`${fmtInt(ov.totalErrors)} errors`}
             help="Calls to CodeGraph's own MCP tools (explore / node / status). Your agent's Read & Grep don't go through CodeGraph, so they are NOT counted here — CodeGraph can't see them."
           />
-          <StatCard label="Success rate" value={fmtPct(ov.totalCalls - ov.totalErrors, ov.totalCalls)} accent="#3fb950" />
+          <StatCard
+            label="Answered rate"
+            value={fmtPct(ov.totalCalls - ov.totalErrors - (ov.totalGuidance ?? 0), ov.totalCalls)}
+            sub={`${fmtInt(ov.totalErrors)} errors · ${fmtInt(ov.totalGuidance ?? 0)} guidance`}
+            accent="#3fb950"
+            help="Share of calls answered from a real index. 'Guidance' counts the success-shaped replies CodeGraph returns when a project isn't indexed (deliberately not errors, so agents don't abandon the tools) — the old Success rate counted those as successes, which pinned it at ~100% and made it meaningless."
+          />
           <StatCard
             label="Context served" value={fmtTokens(ov.totalOutTokens)} sub="delivered to the agent · ≈ chars/4" accent="#58a6ff"
             help="Estimated size of the context CodeGraph RETURNED to your agent — a proxy for how much it delivered, NOT tokens saved. Real savings can only be measured by comparing against not using CodeGraph at all."
