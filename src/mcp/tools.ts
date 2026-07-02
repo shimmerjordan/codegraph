@@ -7,6 +7,8 @@
 import type CodeGraph from '../index';
 import type { QueryPool } from './query-pool';
 import { findNearestCodeGraphRoot } from '../directory';
+import { ReadCache } from './read-cache';
+import { getMetrics } from '../metrics';
 // Lazy-load the heavy CodeGraph chain off the MCP startup path — see the same
 // helper in engine.ts. ToolHandler must load to answer tools/list (static
 // schemas), but it must NOT drag in sqlite/query layers before the daemon binds;
@@ -806,8 +808,17 @@ export class ToolHandler {
   // main loop stays free for the MCP transport under concurrent load. Null in
   // direct/in-process mode (one client, no concurrency to parallelize).
   private queryPool: QueryPool | null = null;
+  // Bounded TTL memo in front of read-tool dispatch (both pool + in-process).
+  // Records hit/miss to the local metrics store and is invalidated per-root
+  // by the engine when the watcher auto-syncs a change. See {@link ReadCache}.
+  private readCache = new ReadCache();
 
   constructor(private cg: CodeGraph | null) {}
+
+  /** Engine-only: drop cached read results for a root that just re-synced. */
+  invalidateReadCache(root: string): void {
+    this.readCache.invalidateRoot(root);
+  }
 
   /**
    * Engine-only: attach (or detach with null) the worker-thread query pool. The
@@ -1378,9 +1389,25 @@ export class ToolHandler {
       // result flows through the cross-cutting notices — worktree-index mismatch
       // (#155) and per-file staleness (#403) — which need the watched MAIN
       // instance and so are always applied here, never in the worker.
-      const result = (this.queryPool && this.queryPool.healthy)
-        ? await this.queryPool.run(toolName, args)
-        : await this.executeReadTool(toolName, args);
+      // Resolve the index root for cache keying + the cache-hit metric. Cheap
+      // walk-up; best-effort — an unresolvable project just skips the cache.
+      let cacheRoot: string | null = null;
+      try { cacheRoot = this.getCodeGraph(args.projectPath as string | undefined).getProjectRoot(); } catch { /* skip cache */ }
+
+      let result: ToolResult;
+      const cached = cacheRoot ? this.readCache.get(cacheRoot, toolName, args) : undefined;
+      if (cached) {
+        result = cached;
+        if (cacheRoot) getMetrics().recordCache(cacheRoot, true);
+      } else {
+        result = (this.queryPool && this.queryPool.healthy)
+          ? await this.queryPool.run(toolName, args)
+          : await this.executeReadTool(toolName, args);
+        if (cacheRoot) {
+          getMetrics().recordCache(cacheRoot, false);
+          this.readCache.set(cacheRoot, toolName, args, result);
+        }
+      }
       const withWorktree = this.withWorktreeNotice(result, args.projectPath as string | undefined);
       return this.withStalenessNotice(withWorktree, args.projectPath as string | undefined);
     } catch (err) {

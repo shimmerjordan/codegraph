@@ -37,6 +37,8 @@ import { relaunchWithWasmRuntimeFlagsIfNeeded } from '../extraction/wasm-runtime
 import { installCommandSupervision } from './command-supervision';
 import { EXTRACTION_VERSION } from '../extraction/extraction-version';
 import { getTelemetry, TELEMETRY_DOCS, recordIndexEvent } from '../telemetry';
+import { getMetrics } from '../metrics';
+import { CodeGraphPackageVersion } from '../mcp/version';
 
 // Lazy-load heavy modules (CodeGraph, runInstaller) to keep CLI startup fast.
 async function loadCodeGraph(): Promise<typeof import('../index')> {
@@ -85,31 +87,42 @@ if (nodeMajor < MIN_NODE_MAJOR) {
   // Override active — banner shown for visibility, continuing.
 }
 
-// Re-exec with V8's `--liftoff-only` if it isn't already set, so tree-sitter's
-// large WASM grammars never hit the turboshaft Zone OOM (`Fatal process out of
-// memory: Zone`) on Node >= 22. No-op under the bundled launcher, which already
-// passes the flag. Must run before any grammar (in the parse worker, which
-// inherits this process's flags) is compiled. See ../extraction/wasm-runtime-flags.
-relaunchWithWasmRuntimeFlagsIfNeeded(__filename);
-
-// Last-resort fatal handlers: log a bounded line and exit non-zero. A fault
-// that reaches here escaped every boundary, so the process is in an undefined
-// state — keeping it alive is what let the detached MCP daemon orphan and pin a
-// CPU core with no recovery (#799, #850). Installed before the command branch
-// so it also covers a synchronous throw during startup. See ./fatal-handler.
-installFatalHandlers();
-
-// Check if running with no arguments - run installer
-if (process.argv.length === 2) {
-  import('../installer').then(({ runInstaller }) =>
-    runInstaller()
-  ).catch((err) => {
-    console.error('Installation failed:', err instanceof Error ? err.message : String(err));
-    process.exit(1);
-  });
+// Fast-path the record-only PostToolUse metrics hook BEFORE any heavy startup
+// (the WASM re-exec, fatal handlers, installer, full command parsing). It fires
+// on the agent's every Read/Grep/Glob, so it must add near-zero latency: it just
+// bumps a local counter in metrics.db and exits. Fully self-contained — never
+// prints, never throws out, always exits 0. See ./hook.
+if (process.argv[2] === 'hook') {
+  void import('./hook')
+    .then(({ runHook }) => runHook(process.argv.slice(3)))
+    .catch(() => { process.exit(0); });
 } else {
-  // Normal CLI flow
-  main();
+  // Re-exec with V8's `--liftoff-only` if it isn't already set, so tree-sitter's
+  // large WASM grammars never hit the turboshaft Zone OOM (`Fatal process out of
+  // memory: Zone`) on Node >= 22. No-op under the bundled launcher, which already
+  // passes the flag. Must run before any grammar (in the parse worker, which
+  // inherits this process's flags) is compiled. See ../extraction/wasm-runtime-flags.
+  relaunchWithWasmRuntimeFlagsIfNeeded(__filename);
+
+  // Last-resort fatal handlers: log a bounded line and exit non-zero. A fault
+  // that reaches here escaped every boundary, so the process is in an undefined
+  // state — keeping it alive is what let the detached MCP daemon orphan and pin a
+  // CPU core with no recovery (#799, #850). Installed before the command branch
+  // so it also covers a synchronous throw during startup. See ./fatal-handler.
+  installFatalHandlers();
+
+  // Check if running with no arguments - run installer
+  if (process.argv.length === 2) {
+    import('../installer').then(({ runInstaller }) =>
+      runInstaller()
+    ).catch((err) => {
+      console.error('Installation failed:', err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    });
+  } else {
+    // Normal CLI flow
+    main();
+  }
 }
 
 function main() {
@@ -457,6 +470,38 @@ async function recordIndexTelemetry(
   await getTelemetry().flushNow();
 }
 
+/**
+ * Register a CONFIGURED project into the local metrics store so it shows in the
+ * dashboard immediately — even before any agent drives a tool call. Keyed on
+ * the realpath'd root to match how the daemon records the same project. Runs on
+ * `init`/`index` (stamps the init time) and `sync` (refreshes index size).
+ * Best-effort and fail-silent — metrics must never break a CLI command.
+ */
+function recordProjectMetrics(
+  cg: { getStats(): { fileCount: number; nodeCount: number; edgeCount: number; filesByLanguage: Record<string, number>; dbSizeBytes: number } },
+  projectPath: string,
+  stampInit = true,
+): void {
+  try {
+    let root = projectPath;
+    try { root = fs.realpathSync(projectPath); } catch { /* use as-is */ }
+    const stats = cg.getStats();
+    const snap = {
+      root,
+      files: stats.fileCount, nodes: stats.nodeCount, edges: stats.edgeCount,
+      languages: stats.filesByLanguage, dbSizeBytes: stats.dbSizeBytes,
+      version: CodeGraphPackageVersion, pid: 0, startedAt: 0,
+    };
+    // init/index stamp the (re)configure time; sync only refreshes index size
+    // and must leave the existing init time intact.
+    if (stampInit) getMetrics().recordProject(snap);
+    else getMetrics().recordSnapshot(snap);
+    getMetrics().flush();
+  } catch {
+    /* never break a command over metrics */
+  }
+}
+
 // =============================================================================
 // Commands
 // =============================================================================
@@ -492,6 +537,16 @@ program
       if (isInitialized(projectPath)) {
         clack.log.warn(`Already initialized in ${projectPath}`);
         clack.log.info('Use "codegraph index" to re-index or "codegraph sync" to update');
+        // It IS a configured project — register it into the dashboard's list
+        // (with its current index size) even though we don't re-index here. This
+        // is what surfaces a project that was init'd before this build existed,
+        // or via the web "Init & index" button on an already-initialized path.
+        try {
+          const { default: CodeGraph } = await loadCodeGraph();
+          const existing = await CodeGraph.open(projectPath);
+          recordProjectMetrics(existing, projectPath);
+          existing.destroy();
+        } catch { /* best-effort — never fail init over metrics */ }
         try {
           const { offerWatchFallback } = await import('../installer');
           await offerWatchFallback(clack, projectPath);
@@ -529,6 +584,7 @@ program
       }
       printIndexResult(clack, result, projectPath);
       await recordIndexTelemetry(cg, result);
+      recordProjectMetrics(cg, projectPath);
 
       try {
         const { offerWatchFallback } = await import('../installer');
@@ -651,6 +707,7 @@ program
           // Quiet mode: no UI, just run against the freshly-recreated graph.
           const result = await cg.indexAll();
           if (!result.success) process.exit(1);
+          recordProjectMetrics(cg, projectPath);
           cg.destroy();
           return;
         }
@@ -676,6 +733,7 @@ program
 
         printIndexResult(clack, result, projectPath);
         await recordIndexTelemetry(cg, result);
+        recordProjectMetrics(cg, projectPath);
 
         if (!result.success) {
           process.exit(1);
@@ -715,6 +773,7 @@ program
 
       if (options.quiet) {
         await cg.sync();
+        recordProjectMetrics(cg, projectPath, false);
         cg.destroy();
         return;
       }
@@ -744,6 +803,7 @@ program
         clack.log.info(`${details.join(', ')} ${getGlyphs().dash} ${formatNumber(result.nodesUpdated)} nodes in ${formatDuration(result.durationMs)}`);
       }
 
+      recordProjectMetrics(cg, projectPath, false);
       clack.outro('Done');
       cg.destroy();
     } catch (err) {
@@ -1482,6 +1542,61 @@ program
       note: (m) => clack.log.success(m),
       done: (m) => clack.outro(m),
     });
+  });
+
+/**
+ * codegraph dashboard
+ */
+program
+  .command('dashboard')
+  .aliases(['web', 'monitor'])
+  .description('Open the local web dashboard — monitor tool usage, token estimates, cache hits, and workspaces across this machine')
+  .option('-p, --port <port>', 'Port to listen on', '4319')
+  .option('-H, --host <host>', 'Host to bind (use 0.0.0.0 to expose on your LAN)', '127.0.0.1')
+  .option('--no-open', "Don't open a browser automatically")
+  .option('--dev', 'Development mode: serve the frontend with hot-reload (Vite HMR) so edits to the dashboard UI apply live — no rebuild or restart. Requires a source checkout.')
+  .action(async (opts: { port: string; host: string; open: boolean; dev?: boolean }) => {
+    const { startDashboardServer, startViteDevServer, openBrowser } = await import('../dashboard/server');
+    const port = Number(opts.port);
+    if (!Number.isInteger(port) || port < 0 || port > 65535) {
+      console.error(chalk.red(`Invalid --port: ${opts.port}`));
+      process.exitCode = 1;
+      return;
+    }
+    try {
+      const { url } = await startDashboardServer({ port, host: opts.host });
+      console.log(chalk.bold('\nCodeGraph Dashboard\n'));
+      if (opts.host !== '127.0.0.1' && opts.host !== 'localhost') {
+        info('Bound to a non-loopback host — the dashboard is reachable from your network.');
+      }
+      info('Reading metrics from ~/.codegraph/metrics.db (shared by every daemon on this machine).');
+      if (opts.dev) {
+        // Hot-reload dev mode: the built SPA at `url` is bypassed — Vite serves
+        // the frontend with HMR and proxies /api back to this server.
+        info(`API serving at ${chalk.cyan(url)}`);
+        info('Starting the hot-reload frontend (Vite HMR) — it will print its own URL below.');
+        info('Edit src/dashboard/web/src/* and changes apply live; no rebuild or restart.');
+        const child = startViteDevServer({ apiUrl: url, host: opts.host, open: opts.open });
+        if (!child) {
+          info(`Vite unavailable — falling back to the built UI at ${chalk.cyan(url)}.`);
+          if (opts.open) openBrowser(url);
+        }
+      } else {
+        info(`Serving at ${chalk.cyan(url)}`);
+        if (opts.open) openBrowser(url);
+      }
+      info('Press Ctrl+C to stop.');
+      // Keep the process alive until interrupted.
+      await new Promise<void>(() => { /* run until SIGINT */ });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes('EADDRINUSE')) {
+        console.error(chalk.red(`Port ${port} is already in use. Try: codegraph dashboard --port <other>`));
+      } else {
+        console.error(chalk.red(`Failed to start dashboard: ${msg}`));
+      }
+      process.exitCode = 1;
+    }
   });
 
 /**

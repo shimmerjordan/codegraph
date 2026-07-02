@@ -16,6 +16,8 @@ import { findNearestCodeGraphRoot } from '../directory';
 import { watchDisabledReason } from '../sync';
 import { ToolHandler } from './tools';
 import { QueryPool, resolvePoolSize } from './query-pool';
+import { getMetrics } from '../metrics';
+import { CodeGraphPackageVersion } from './version';
 
 // Lazy-load the heavy CodeGraph chain (sqlite + query/graph/context layers) OFF
 // the MCP startup path. It's only needed once a tool actually opens a project —
@@ -65,6 +67,9 @@ export class MCPEngine {
   // Off-loop read-tool pool (daemon mode only). Created lazily once the default
   // project is open — workers each hold their own WAL read connection.
   private queryPool: QueryPool | null = null;
+  // Epoch ms this engine came up — surfaced as the workspace's daemon uptime
+  // in the dashboard snapshot.
+  private readonly startedAt = Date.now();
 
   constructor(opts: MCPEngineOptions = {}) {
     this.opts = { watch: opts.watch ?? true, queryPool: opts.queryPool ?? false };
@@ -109,6 +114,40 @@ export class MCPEngine {
   /** Project root that the engine resolved on first init (null if none). */
   getProjectPath(): string | null {
     return this.projectPath;
+  }
+
+  /**
+   * Snapshot the open project's index size + this process's identity into the
+   * local metrics store (the dashboard's per-workspace view). Best-effort and
+   * fail-silent — never touches a tool call. Also (idempotently) starts the
+   * metrics flush interval, since a live engine is a long-lived process.
+   */
+  private recordMetricsSnapshot(): void {
+    const cg = this.cg;
+    const root = this.projectPath;
+    if (!cg || !root) return;
+    try {
+      const stats = cg.getStats();
+      getMetrics().recordSnapshot({
+        root,
+        files: stats.fileCount,
+        nodes: stats.nodeCount,
+        edges: stats.edgeCount,
+        languages: stats.filesByLanguage as unknown as Record<string, number>,
+        dbSizeBytes: stats.dbSizeBytes,
+        version: CodeGraphPackageVersion,
+        pid: process.pid,
+        startedAt: this.startedAt,
+        // A daemon only ever opens an already-configured project (it must have a
+        // .codegraph/), so mark it configured too — set-once in the store keeps
+        // an earlier CLI init time if there was one. Without this, a project used
+        // only via an agent (never CLI-init'd on this build) would stay hidden.
+        initializedAt: this.startedAt,
+      });
+      getMetrics().startInterval();
+    } catch {
+      /* metrics must never break the engine */
+    }
   }
 
   /** Shared ToolHandler — sessions delegate tool dispatch through this. */
@@ -172,6 +211,7 @@ export class MCPEngine {
       this.startWatching();
       this.catchUpSync();
       this.maybeStartPool(resolvedRoot);
+      this.recordMetricsSnapshot();
     } catch {
       // Still failing — caller will try again on the next tool call.
     }
@@ -215,6 +255,7 @@ export class MCPEngine {
       this.startWatching();
       this.catchUpSync();
       this.maybeStartPool(resolvedRoot);
+      this.recordMetricsSnapshot();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       process.stderr.write(`[CodeGraph MCP] Failed to open project at ${resolvedRoot}: ${msg}\n`);
@@ -258,6 +299,10 @@ export class MCPEngine {
           process.stderr.write(
             `[CodeGraph MCP] Auto-synced ${result.filesChanged} file(s) in ${result.durationMs}ms\n`
           );
+          // The graph changed under us: drop cached read results for this root
+          // (they may now be stale) and refresh the dashboard's index snapshot.
+          if (this.projectPath) this.toolHandler.invalidateReadCache(this.projectPath);
+          this.recordMetricsSnapshot();
         }
       },
       onSyncError: (err) => {

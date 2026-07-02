@@ -20,6 +20,7 @@ import { SERVER_INSTRUCTIONS, SERVER_INSTRUCTIONS_NO_ROOT_INDEX } from './server
 import { CodeGraphPackageVersion } from './version';
 import { findNearestCodeGraphRoot } from '../directory';
 import { getTelemetry, ClientInfo } from '../telemetry';
+import { getMetrics, estimateResultTokens } from '../metrics';
 
 /**
  * MCP Server Info — kept on the session because some clients log it. The
@@ -262,11 +263,21 @@ export class MCPSession {
 
     await this.retryInitIfNeeded();
 
+    const startedAt = Date.now();
     const result = await this.engine.getToolHandler().execute(toolName, toolArgs);
+    const durationMs = Date.now() - startedAt;
     this.transport.sendResult(request.id, result);
-    // After the reply is on the wire — telemetry must never delay a tool
-    // response (in-memory increment only; see src/telemetry).
+    // After the reply is on the wire — recording must never delay a tool
+    // response (in-memory increment only; see src/telemetry + src/metrics).
     getTelemetry().recordUsage('mcp_tool', toolName, !result.isError, this.clientInfo);
+    getMetrics().recordToolCall({
+      workspace: this.engine.getProjectPath(),
+      tool: toolName,
+      agent: this.clientInfo?.name,
+      ok: !result.isError,
+      durationMs,
+      outTokens: estimateResultTokens(result),
+    });
   }
 
   /**

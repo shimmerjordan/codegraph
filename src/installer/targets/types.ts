@@ -75,6 +75,16 @@ export interface InstallOptions {
    * leaves it untouched. Targets without a prompt-hook concept ignore it.
    */
   promptHook?: boolean;
+  /**
+   * Read-tracking metrics hook (Claude `PostToolUse`, matcher `Read|Grep|Glob`)
+   * that runs `codegraph hook post-tool-use` to count the agent's OWN file reads
+   * for the dashboard's "CodeGraph vs raw file reads" comparison — the one
+   * signal CodeGraph can't see from inside its MCP server. `true` installs it,
+   * `false` removes any prior install (so a metrics opt-out round-trips),
+   * `undefined` leaves it untouched. Auto-enabled at install when metrics
+   * collection is on. Targets without a hook concept ignore it.
+   */
+  readHook?: boolean;
 }
 
 export interface AgentTarget {

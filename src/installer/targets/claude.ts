@@ -133,6 +133,18 @@ class ClaudeCodeTarget implements AgentTarget {
       if (removed.action === 'removed') files.push(removed);
     }
 
+    // 2d. Read-tracking metrics hook (Claude PostToolUse, Read|Grep|Glob). Unlike
+    // the opt-in prompt hook, this is auto-enabled: it powers the dashboard's
+    // raw-read comparison and is written automatically when metrics collection
+    // is on. `readHook === true` writes it; `=== false` strips any prior install
+    // (a metrics opt-out round-trips); `undefined` leaves it untouched.
+    if (opts.readHook === true) {
+      files.push(writeReadTrackingHookEntry(loc));
+    } else if (opts.readHook === false) {
+      const removed = removeReadTrackingHookEntry(loc);
+      if (removed.action === 'removed') files.push(removed);
+    }
+
     // 3. CLAUDE.md instructions — the short marker-fenced CodeGraph
     // block (#704). The MCP initialize instructions reach only the main
     // agent; CLAUDE.md is what Task-tool subagents (and non-MCP
@@ -202,6 +214,10 @@ class ClaudeCodeTarget implements AgentTarget {
     // 2c. Remove the front-load prompt hook this installer may have written.
     const promptHookCleanup = removePromptHookEntry(loc);
     if (promptHookCleanup.action === 'removed') files.push(promptHookCleanup);
+
+    // 2d. Remove the read-tracking metrics hook this installer may have written.
+    const readHookCleanup = removeReadTrackingHookEntry(loc);
+    if (readHookCleanup.action === 'removed') files.push(readHookCleanup);
 
     // 3. Instructions — strip the legacy CodeGraph block if present.
     files.push(removeInstructionsEntry(loc));
@@ -302,6 +318,17 @@ function isLegacyCodegraphHookCommand(command: unknown): boolean {
 const PROMPT_HOOK_COMMAND = 'codegraph prompt-hook';
 function isPromptHookCommand(command: unknown): boolean {
   return typeof command === 'string' && command.includes(PROMPT_HOOK_COMMAND);
+}
+
+/**
+ * The read-tracking metrics hook the installer writes into Claude's
+ * `PostToolUse` (see writeReadTrackingHookEntry). Matched by substring so an
+ * `npx @colbymchenry/codegraph hook post-tool-use` form is recognized too.
+ */
+const READ_HOOK_COMMAND = 'codegraph hook post-tool-use';
+const READ_HOOK_MATCHER = 'Read|Grep|Glob';
+function isReadTrackingHookCommand(command: unknown): boolean {
+  return typeof command === 'string' && command.includes(READ_HOOK_COMMAND);
 }
 
 /**
@@ -434,6 +461,53 @@ export function writePromptHookEntry(loc: Location): WriteResult['files'][number
   });
   writeJsonFile(file, settings);
   return { path: file, action: created ? 'created' : 'updated' };
+}
+
+/**
+ * Write the read-tracking `PostToolUse` hook into Claude `settings.json` — a
+ * `command` hook (matcher `Read|Grep|Glob`) that runs `codegraph hook
+ * post-tool-use`. That command bumps a local counter in
+ * `~/.codegraph/metrics.db` so the dashboard's "CodeGraph vs raw file reads"
+ * panel can count the files the agent reads DIRECTLY — the one signal CodeGraph
+ * can't observe from inside its own MCP server. Fully local; the hook always
+ * exits 0 and never blocks or annotates a tool result.
+ *
+ * Idempotent: if our command is already wired under PostToolUse the file is left
+ * byte-for-byte untouched and reported `unchanged`. Sibling hooks (the user's
+ * own, or other events/matchers) are preserved. Auto-enabled at install
+ * (default-on, gated on metrics being enabled) — see src/installer/index.ts.
+ */
+export function writeReadTrackingHookEntry(loc: Location): WriteResult['files'][number] {
+  const file = settingsJsonPath(loc);
+  const created = !fs.existsSync(file);
+  const settings = readJsonFile(file);
+
+  if (!settings.hooks || typeof settings.hooks !== 'object' || Array.isArray(settings.hooks)) {
+    settings.hooks = {};
+  }
+  if (!Array.isArray(settings.hooks.PostToolUse)) settings.hooks.PostToolUse = [];
+
+  const already = settings.hooks.PostToolUse.some(
+    (g: any) => g && Array.isArray(g.hooks) && g.hooks.some((h: any) => isReadTrackingHookCommand(h?.command)),
+  );
+  if (already) return { path: file, action: 'unchanged' };
+
+  settings.hooks.PostToolUse.push({
+    matcher: READ_HOOK_MATCHER,
+    hooks: [{ type: 'command', command: READ_HOOK_COMMAND }],
+  });
+  writeJsonFile(file, settings);
+  return { path: file, action: created ? 'created' : 'updated' };
+}
+
+/**
+ * Remove the read-tracking `PostToolUse` hook this installer writes (see
+ * writeReadTrackingHookEntry). Used by `uninstall`, and by `install` when
+ * metrics are disabled, so the opt-out round-trips. Surgical — only our command
+ * is dropped; sibling PostToolUse hooks survive.
+ */
+export function removeReadTrackingHookEntry(loc: Location): WriteResult['files'][number] {
+  return removeHookCommandsMatching(loc, isReadTrackingHookCommand);
 }
 
 /**

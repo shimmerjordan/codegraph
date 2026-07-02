@@ -43,8 +43,13 @@ export const WASM_RUNTIME_FLAGS: readonly string[] = ['--liftoff-only'];
 /**
  * Env var set on the relaunched child so a detection slip can never cause an
  * infinite re-exec loop. Also lets users force-disable the relaunch.
+ *
+ * Exported so a long-lived process that itself came up through the re-exec (e.g.
+ * the dashboard server) can SCRUB this — together with {@link HOST_PPID_ENV} —
+ * from any CLI child it spawns, so the child re-execs fresh and stamps its own
+ * live host pid instead of inheriting a stale one.
  */
-const RELAUNCH_GUARD_ENV = 'CODEGRAPH_WASM_RELAUNCHED';
+export const RELAUNCH_GUARD_ENV = 'CODEGRAPH_WASM_RELAUNCHED';
 
 /**
  * Env var carrying the *host* PID (the relauncher's own parent) across the

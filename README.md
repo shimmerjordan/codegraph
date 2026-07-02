@@ -2,6 +2,8 @@
 
 # CodeGraph
 
+**English** · [简体中文](README.zh.md)
+
 ## 🎉 1.0 Released!
 
 Already installed? Run `codegraph upgrade`
@@ -488,6 +490,7 @@ codegraph callees <symbol>        # Find what a function/method calls (--limit, 
 codegraph impact <symbol>         # Analyze what code is affected by changing a symbol (--depth, --json)
 codegraph affected [files...]     # Find test files affected by changes (see below)
 codegraph daemon                  # Manage background daemons — pick one to stop (alias: daemons)
+codegraph dashboard               # Open the local web dashboard — usage, tokens, cache, workspaces (alias: web, monitor)
 codegraph telemetry [on|off]      # Show or change anonymous usage telemetry
 codegraph upgrade [version]       # Update to the latest release (--check, --force)
 codegraph version                 # Print the installed version (also -v, --version)
@@ -640,6 +643,32 @@ defaults and win on conflict, so you can also re-point a built-in (e.g.
 language or a malformed file is warned about and skipped — it never breaks
 indexing — and a project with no `codegraph.json` behaves exactly as before.
 Re-index (`codegraph index`) after adding or changing mappings.
+
+## Dashboard
+
+A local web UI to **monitor how CodeGraph is used on your machine** — tool-call
+volume and success rate, the context tokens CodeGraph served (estimated),
+read-cache hit rate, live daemon CPU / memory / disk, and every project you've
+indexed, with pie + line charts and per-project drill-down. It also shows **how
+much direct file-reading (`Read`/`Grep`/`Glob`) CodeGraph displaces** — powered
+by an optional read-tracking hook that `codegraph install` wires into Claude
+Code for you (only while usage metrics are enabled). You can `init` / `sync` /
+re-index / remove a project right from the page, and projects you've already
+indexed are discovered automatically. All data is read from a single local file
+and **never leaves your machine**.
+
+Start it any time (it does not auto-start):
+
+```bash
+codegraph dashboard          # opens http://127.0.0.1:4319 (aliases: web, monitor)
+```
+
+Building from source? Run `npm run build:all` first (it builds the CLI **and**
+the web UI), then `node dist/bin/codegraph.js dashboard`.
+
+[**`DASHBOARD.md`**](DASHBOARD.md) is the full guide — deploy from source,
+command options, config/privacy switches, exposing it on an intranet (systemd +
+nginx), troubleshooting, and the roadmap for the team-wide central server.
 
 ## Telemetry
 

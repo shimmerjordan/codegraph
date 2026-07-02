@@ -9,6 +9,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- A local web dashboard (`codegraph dashboard`, also `codegraph web`) to monitor how CodeGraph is used on your machine — tool-call volume and success rate, the context CodeGraph served, cache hit rate, live daemon CPU/memory, and every indexed workspace, with charts and per-project drill-down. All data is read from a single local file and never leaves your machine. See `DASHBOARD.md`.
+- The dashboard can also show how much direct file-reading (`Read`/`Grep`/`Glob`) CodeGraph displaces. To make that possible, `codegraph install` now automatically wires the required tracking hook into Claude Code's settings (only when usage metrics are enabled — it's skipped, and later removed, if you opt out). If the hook isn't set up, the dashboard shows a clear warning with a one-click button to enable it.
 
 ## [1.1.6] - 2026-06-30
 

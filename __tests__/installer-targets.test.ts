@@ -21,7 +21,7 @@ import * as os from 'os';
 import { ALL_TARGETS, getTarget, resolveTargetFlag } from '../src/installer/targets/registry';
 import { uninstallTargets } from '../src/installer';
 import { upsertTomlTable, removeTomlTable, buildTomlTable } from '../src/installer/targets/toml';
-import { cleanupLegacyHooks, writePromptHookEntry, removePromptHookEntry } from '../src/installer/targets/claude';
+import { cleanupLegacyHooks, writePromptHookEntry, removePromptHookEntry, writeReadTrackingHookEntry, removeReadTrackingHookEntry } from '../src/installer/targets/claude';
 
 function mkTmpDir(label: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), `cg-targets-${label}-`));
@@ -1174,6 +1174,91 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(promptCommands(s)).not.toContain('codegraph prompt-hook');
     const stopCmds = (s.hooks?.Stop ?? []).flatMap((g: any) => (g.hooks ?? []).map((h: any) => h.command));
     expect(stopCmds).toContain('codegraph sync-if-dirty');
+  });
+
+  // ---- Read-tracking metrics hook (PostToolUse: Read|Grep|Glob) ----
+  // Auto-enabled at install (`readHook`) so the dashboard can count the agent's
+  // own file reads. Must write/remove surgically, be idempotent, round-trip a
+  // metrics opt-out, and carry the Read|Grep|Glob matcher — all without
+  // disturbing the user's own hooks.
+  const postToolCommands = (s: any): string[] =>
+    (s.hooks?.PostToolUse ?? []).flatMap((g: any) => (g.hooks ?? []).map((h: any) => h.command));
+  const postToolMatchers = (s: any): string[] =>
+    (s.hooks?.PostToolUse ?? []).map((g: any) => g.matcher);
+
+  it('claude: install with readHook:true writes the PostToolUse hook with the Read|Grep|Glob matcher', () => {
+    const claude = getTarget('claude')!;
+    claude.install('global', { autoAllow: true, readHook: true });
+    const s = JSON.parse(fs.readFileSync(path.join(tmpHome, '.claude', 'settings.json'), 'utf-8'));
+    expect(postToolCommands(s)).toContain('codegraph hook post-tool-use');
+    expect(postToolMatchers(s)).toContain('Read|Grep|Glob');
+  });
+
+  it('claude: install without readHook does NOT add the PostToolUse hook', () => {
+    const claude = getTarget('claude')!;
+    claude.install('global', { autoAllow: true });
+    const s = JSON.parse(fs.readFileSync(path.join(tmpHome, '.claude', 'settings.json'), 'utf-8'));
+    expect(postToolCommands(s)).not.toContain('codegraph hook post-tool-use');
+  });
+
+  it('claude: install with readHook:true is idempotent (no duplicate, byte-identical re-run)', () => {
+    const claude = getTarget('claude')!;
+    const file = path.join(tmpHome, '.claude', 'settings.json');
+    claude.install('global', { autoAllow: true, readHook: true });
+    const first = fs.readFileSync(file, 'utf-8');
+    claude.install('global', { autoAllow: true, readHook: true });
+    expect(fs.readFileSync(file, 'utf-8')).toBe(first);
+    const s = JSON.parse(first);
+    expect(postToolCommands(s).filter((c: string) => c === 'codegraph hook post-tool-use')).toHaveLength(1);
+  });
+
+  it('claude: install with readHook:false strips a hook a prior install wrote (metrics opt-out round-trips)', () => {
+    const claude = getTarget('claude')!;
+    claude.install('global', { autoAllow: true, readHook: true });
+    claude.install('global', { autoAllow: true, readHook: false });
+    const s = JSON.parse(fs.readFileSync(path.join(tmpHome, '.claude', 'settings.json'), 'utf-8'));
+    expect(postToolCommands(s)).not.toContain('codegraph hook post-tool-use');
+  });
+
+  it('claude: writeReadTrackingHookEntry preserves a sibling PostToolUse hook', () => {
+    const file = seedSettings('global', {
+      hooks: { PostToolUse: [{ matcher: 'Edit', hooks: [{ type: 'command', command: 'my-own-hook' }] }] },
+    });
+    expect(writeReadTrackingHookEntry('global').action).toBe('updated');
+    const s = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    expect(postToolCommands(s)).toEqual(['my-own-hook', 'codegraph hook post-tool-use']);
+    expect(postToolMatchers(s)).toEqual(['Edit', 'Read|Grep|Glob']);
+  });
+
+  it('claude: removeReadTrackingHookEntry drops only our command, keeping a sibling in the same event', () => {
+    const file = seedSettings('global', {
+      hooks: {
+        PostToolUse: [
+          { matcher: 'Read|Grep|Glob', hooks: [{ type: 'command', command: 'codegraph hook post-tool-use' }] },
+          { matcher: 'Edit', hooks: [{ type: 'command', command: 'my-own-hook' }] },
+        ],
+      },
+    });
+    expect(removeReadTrackingHookEntry('global').action).toBe('removed');
+    const s = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    expect(postToolCommands(s)).toEqual(['my-own-hook']);
+  });
+
+  it('claude: uninstall removes the read-tracking hook it wrote', () => {
+    const claude = getTarget('claude')!;
+    claude.install('global', { autoAllow: true, readHook: true });
+    claude.uninstall('global');
+    const file = path.join(tmpHome, '.claude', 'settings.json');
+    const s = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    expect(postToolCommands(s)).not.toContain('codegraph hook post-tool-use');
+  });
+
+  it('claude: the default install path writes BOTH the prompt hook and the read-tracking hook to one settings.json', () => {
+    const claude = getTarget('claude')!;
+    claude.install('global', { autoAllow: true, promptHook: true, readHook: true });
+    const s = JSON.parse(fs.readFileSync(path.join(tmpHome, '.claude', 'settings.json'), 'utf-8'));
+    expect(promptCommands(s)).toContain('codegraph prompt-hook');       // UserPromptSubmit intact
+    expect(postToolCommands(s)).toContain('codegraph hook post-tool-use'); // PostToolUse intact
   });
 });
 

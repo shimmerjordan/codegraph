@@ -29,6 +29,7 @@ import { watchDisabledReason } from '../sync/watch-policy';
 import { isGitRepo, isSyncHookInstalled, installGitSyncHook } from '../sync/git-hooks';
 import { getCodeGraphDir, codeGraphDirName } from '../directory';
 import { getTelemetry, TELEMETRY_DOCS } from '../telemetry';
+import { isMetricsEnabled } from '../metrics';
 
 // Backwards-compat: keep these named exports — downstream code may
 // import them. The shim in `config-writer.ts` continues to re-export
@@ -226,6 +227,20 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
     }
   }
 
+  // Step 4⅞: read-tracking metrics hook (Claude Code only). A PostToolUse hook
+  // (matcher Read|Grep|Glob) that runs `codegraph hook post-tool-use`, bumping a
+  // local counter so the dashboard can show how much raw file-reading CodeGraph
+  // displaces. Auto-enabled — NO prompt: it's written automatically whenever
+  // Claude is a target and metrics collection is on ("root the tool in the
+  // environment we detect"). When metrics are OFF (CODEGRAPH_METRICS=0 /
+  // CODEGRAPH_DASHBOARD=0 / DO_NOT_TRACK=1) we pass `false` so any prior hook is
+  // stripped and the opt-out round-trips. Fully local; only Claude Code has this
+  // hook shape, so other targets ignore the option.
+  let readHook: boolean | undefined;
+  if (targets.some((t) => t.id === 'claude')) {
+    readHook = isMetricsEnabled();
+  }
+
   // Step 5: per-target install loop.
   const installedIds: TargetId[] = [];
   let sawCreated = false;
@@ -237,7 +252,7 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
       );
       continue;
     }
-    const result = target.install(location, { autoAllow, promptHook });
+    const result = target.install(location, { autoAllow, promptHook, readHook });
     installedIds.push(target.id);
     for (const file of result.files) {
       if (file.action === 'created') sawCreated = true;
