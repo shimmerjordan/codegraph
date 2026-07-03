@@ -22,6 +22,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Dashboard statistics are now attributed to the project each call actually queried. Previously every call was credited to the daemon's default project, so in monorepos and cross-project sessions one project accumulated all the counts while the others showed zero.
 - Usage recorded while a project path (or agent name) contains a space no longer writes corrupted rows into the metrics database; existing corrupted rows are cleaned up automatically on the next start.
 - Tool calls served during a daemon outage (the in-process fallback) now show up in the dashboard instead of silently vanishing from the stats.
+- Context served through the shell commands (`codegraph explore` / `codegraph node` — the path Task-tool subagents and non-MCP harnesses use) and through the Claude Code prompt hook now counts in the dashboard too. Previously only calls that went through a live MCP daemon session were recorded, so heavy hook/CLI usage showed a frozen dashboard.
 
 ## [1.1.6] - 2026-06-30
 

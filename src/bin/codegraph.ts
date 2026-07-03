@@ -37,7 +37,7 @@ import { relaunchWithWasmRuntimeFlagsIfNeeded } from '../extraction/wasm-runtime
 import { installCommandSupervision } from './command-supervision';
 import { EXTRACTION_VERSION } from '../extraction/extraction-version';
 import { getTelemetry, TELEMETRY_DOCS, recordIndexEvent } from '../telemetry';
-import { getMetrics } from '../metrics';
+import { getMetrics, estimateTokens } from '../metrics';
 import { CodeGraphPackageVersion } from '../mcp/version';
 
 // Lazy-load heavy modules (CodeGraph, runInstaller) to keep CLI startup fast.
@@ -499,6 +499,40 @@ function recordProjectMetrics(
     getMetrics().flush();
   } catch {
     /* never break a command over metrics */
+  }
+}
+
+/**
+ * Record a CLI/hook-served tool call into the local dashboard metrics — the
+ * SAME counters the MCP session records. Without this, context served through
+ * the shell commands (`codegraph explore` / `codegraph node`, the path
+ * shell-mode agents and Task-tool subagents use) and through the Claude
+ * UserPromptSubmit prompt hook was invisible in the dashboard: calls and
+ * "context served" never moved even while agents used codegraph heavily.
+ * One-shot process, so flush immediately. Best-effort and fail-silent.
+ */
+function recordCliToolCall(input: {
+  projectPath: string;
+  tool: string;
+  agent: string;
+  outcome: 'ok' | 'guidance' | 'error';
+  durationMs: number;
+  servedText: string;
+}): void {
+  try {
+    let root = input.projectPath;
+    try { root = fs.realpathSync(input.projectPath); } catch { /* use as-is */ }
+    getMetrics().recordToolCall({
+      workspace: root,
+      tool: input.tool,
+      agent: input.agent,
+      outcome: input.outcome,
+      durationMs: input.durationMs,
+      outTokens: estimateTokens(input.servedText),
+    });
+    getMetrics().flush();
+  } catch {
+    /* metrics must never break a CLI command or the prompt hook */
   }
 }
 
@@ -1081,14 +1115,20 @@ program
 
       const { default: CodeGraph } = await loadCodeGraph();
       const cg = await CodeGraph.open(projectPath);
-      const { ToolHandler } = await import('../mcp/tools');
+      const { ToolHandler, toolCallOutcome } = await import('../mcp/tools');
       const handler = new ToolHandler(cg);
 
       const args: Record<string, unknown> = { query: queryParts.join(' ') };
       if (options.maxFiles) args.maxFiles = parseInt(options.maxFiles, 10);
+      const startedAt = Date.now();
       const result = await handler.execute('codegraph_explore', args);
 
       console.log(result.content[0]?.text ?? '');
+      recordCliToolCall({
+        projectPath, tool: 'codegraph_explore', agent: 'cli',
+        outcome: toolCallOutcome(result), durationMs: Date.now() - startedAt,
+        servedText: result.content[0]?.text ?? '',
+      });
       cg.destroy();
       if (result.isError) process.exit(1);
     } catch (err) {
@@ -1169,8 +1209,9 @@ program
           // explore and inject ~16KB of low-relevance context (issue #994 follow-up).
           // A keyword-bearing prompt skips this — the keyword is signal enough.
           if (!keyworded && !codeTokens.some((t) => cg.getNodesByName(t).length > 0)) return;
-          const { ToolHandler } = await import('../mcp/tools');
+          const { ToolHandler, toolCallOutcome } = await import('../mcp/tools');
           const handler = new ToolHandler(cg);
+          const startedAt = Date.now();
           const result = await handler.execute('codegraph_explore', { query: prompt });
           const text = result.content[0]?.text ?? '';
           if (!result.isError && text.trim()) {
@@ -1187,6 +1228,13 @@ program
             process.stdout.write(
               `<codegraph_context note="Structural context from CodeGraph for this prompt — treat returned source as already read; ${more}.">\n${body}${others}\n</codegraph_context>\n`,
             );
+            // Count the injection in the dashboard — this is context codegraph
+            // served to the agent, exactly like an MCP explore call.
+            recordCliToolCall({
+              projectPath: plan.exploreRoot, tool: 'codegraph_explore', agent: 'prompt-hook',
+              outcome: toolCallOutcome(result), durationMs: Date.now() - startedAt,
+              servedText: body,
+            });
           }
         } finally {
           cg.destroy();
@@ -1242,7 +1290,7 @@ program
 
       const { default: CodeGraph } = await loadCodeGraph();
       const cg = await CodeGraph.open(projectPath);
-      const { ToolHandler } = await import('../mcp/tools');
+      const { ToolHandler, toolCallOutcome } = await import('../mcp/tools');
       const handler = new ToolHandler(cg);
 
       // A name with a path separator is a file read; otherwise a symbol
@@ -1264,9 +1312,15 @@ program
       if (options.limit) args.limit = parseInt(options.limit, 10);
       if (options.symbolsOnly) args.symbolsOnly = true;
 
+      const startedAt = Date.now();
       const result = await handler.execute('codegraph_node', args);
 
       console.log(result.content[0]?.text ?? '');
+      recordCliToolCall({
+        projectPath, tool: 'codegraph_node', agent: 'cli',
+        outcome: toolCallOutcome(result), durationMs: Date.now() - startedAt,
+        servedText: result.content[0]?.text ?? '',
+      });
       cg.destroy();
       if (result.isError) process.exit(1);
     } catch (err) {
